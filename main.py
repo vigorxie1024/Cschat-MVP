@@ -14,6 +14,11 @@ Cschat —— 碳硅基联合体最小协作中枢（零依赖版）
   python main.py
   浏览器打开 http://127.0.0.1:8000
 
+对接 Marvis（可选，配了才生效）：
+  set CSCHAT_WEBHOOK_URL=https://你的地址/webhook   每条消息同时转发出去
+  set CSCHAT_WEBHOOK_SECRET=一串随机字符              用 HMAC-SHA256 签名，头部 X-Cschat-Signature
+  未配置时不转发、也不报错——不假装发过。
+
 接口：
   GET  /            聊天页面
   GET  /events      SSE 实时流
@@ -21,6 +26,8 @@ Cschat —— 碳硅基联合体最小协作中枢（零依赖版）
   POST /say         {"from":"VX","text":"..."}  发一句话
   POST /ask         {"q":"..."}                 问 AI（需要 DEEPSEEK_API_KEY）
 """
+import hashlib
+import hmac
 import json
 import os
 import queue
@@ -34,6 +41,8 @@ PORT = int(os.environ.get("CSCHAT_PORT", "8000"))
 API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 API_URL = os.environ.get("CSCHAT_API", "https://api.deepseek.com/chat/completions")
 MODEL = os.environ.get("CSCHAT_MODEL", "deepseek-chat")
+WEBHOOK_URL = os.environ.get("CSCHAT_WEBHOOK_URL", "")
+WEBHOOK_SECRET = os.environ.get("CSCHAT_WEBHOOK_SECRET", "").encode("utf-8")
 
 HISTORY = []          # [{id, from, text, at}]
 SUBSCRIBERS = []      # [queue.Queue]
@@ -93,6 +102,41 @@ def broadcast(msg):
                 q.put_nowait(msg)
             except Exception:
                 pass
+
+
+def forward_webhook(msg):
+    """把消息转发给外部节点（如 Marvis）。没配地址就安静跳过，不假装发过。
+
+    契约（详见 WEBHOOK.md）：
+      POST <CSCHAT_WEBHOOK_URL>
+      headers: Content-Type: application/json
+               X-Cschat-Signature: sha256=<HmacSHA256(secret, body)>
+      body:    {"event":"message","id":1,"from":"VX","text":"...","at":"..."}
+    失败重试 3 次（0.5s / 1.5s / 3s 退避），最终失败只记日志，不影响本地聊天。
+    """
+    if not WEBHOOK_URL:
+        return
+    body = json.dumps({"event": "message", "id": msg["id"], "from": msg["from"],
+                       "text": msg["text"], "at": msg["at"]}, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if WEBHOOK_SECRET:
+        headers["X-Cschat-Signature"] = "sha256=" + hmac.new(WEBHOOK_SECRET, body, hashlib.sha256).hexdigest()
+
+    def _send():
+        for wait in (0, 0.5, 1.5, 3.0):
+            if wait:
+                time.sleep(wait)
+            try:
+                req = urllib.request.Request(WEBHOOK_URL, data=body, method="POST", headers=headers)
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    if 200 <= r.status < 300:
+                        return
+            except Exception as e:
+                last = str(e)[:120]
+                continue
+        print("[webhook] 转发失败（已重试 3 次）:" + last)
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 def ask_ai(q, who="Cschat"):
@@ -188,6 +232,7 @@ class Handler(BaseHTTPRequestHandler):
                        "text": text[:4000], "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
                 HISTORY.append(msg)
             broadcast(msg)
+            forward_webhook(msg)
             return self._json(200, {"ok": True, "id": msg["id"]})
 
         if self.path == "/ask":
@@ -203,6 +248,7 @@ class Handler(BaseHTTPRequestHandler):
                 msg = {"id": SEQ["n"], "from": "AI", "text": answer, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
                 HISTORY.append(msg)
             broadcast(msg)
+            forward_webhook(msg)
             return self._json(200, {"ok": True, "answer": answer})
 
         self._json(404, {"ok": False, "error": "not found"})
@@ -211,4 +257,5 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     print("Cschat 运行中: http://%s:%d/" % (HOST, PORT))
     print("模型密钥: %s" % ("已配置" if API_KEY else "未配置（/ask 会明确拒绝）"))
+    print("Webhook: %s" % (WEBHOOK_URL if WEBHOOK_URL else "未配置（消息只在本地）"))
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
